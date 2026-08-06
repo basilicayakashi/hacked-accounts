@@ -1,6 +1,46 @@
-import { ButtonInteraction } from "discord.js";
+import "dotenv/config";
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  REST,
+  Routes,
+  ButtonInteraction,
+} from "discord.js";
 import { getGuildConfig, getHijackReport, reviewHijackReport, getAllGuildConfigs } from "./db.js";
 import { resolveImageUrl } from "./images.js";
+import { commands } from "./commands.js";
+
+// ---- Client & connexion ----
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+});
+
+client.once(Events.ClientReady, (c) => {
+  console.log(`Connecté en tant que ${c.user.tag}`);
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isChatInputCommand()) {
+    const command = commands.find((c) => c.data.name === interaction.commandName);
+    if (command) await command.execute(interaction);
+  } else if (interaction.isButton()) {
+    await handleReportReview(interaction);
+  }
+});
+
+async function registerCommands() {
+  const rest = new REST().setToken(process.env.DISCORD_TOKEN!);
+  const body = commands.map((c) => c.data.toJSON());
+
+  await rest.put(Routes.applicationCommands(process.env.CLIENT_ID!), { body });
+  console.log("Slash commands enregistrées.");
+}
+
+client.login(process.env.DISCORD_TOKEN).then(registerCommands);
+
+// ---- Handler de review des rapports ----
 
 export async function handleReportReview(interaction: ButtonInteraction) {
   if (!interaction.guildId || !interaction.guild) return;
@@ -31,7 +71,6 @@ export async function handleReportReview(interaction: ButtonInteraction) {
     return;
   }
 
-  // Compte le nombre de modérateurs (nécessite l'intent GuildMembers + un cache à jour)
   await interaction.guild.members.fetch();
   const moderatorRole = interaction.guild.roles.cache.get(config.moderator_role_id);
   const moderatorCount = moderatorRole?.members.size ?? 0;
@@ -45,7 +84,6 @@ export async function handleReportReview(interaction: ButtonInteraction) {
     });
     return;
   }
-  // Si moderatorCount === 1, le seul modérateur peut approuver même sa propre alerte.
 
   const approvalStatus = action === "approve" ? "approved" : "rejected";
   reviewHijackReport(reportId, approvalStatus, interaction.user.id);
