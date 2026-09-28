@@ -14,10 +14,15 @@ import {
   insertHijackReport,
   getApprovedHijackReportsForUser,
   getActiveHijackedUsers,
+  getHijackReportImages,
   type HijackStatus,
 } from "./db.js";
 
-import { uploadImageToStorage, resolveImageUrl } from "./images.js";
+import { uploadImagesToStorage, resolveImageUrls } from "./images.js";
+
+// Discord attachment options can only carry one file each, so a fixed number
+// of optional "imageN" slots is how /alert accepts several images at once.
+const MAX_IMAGES = 5;
 
 // ---- /setup ----
 
@@ -28,7 +33,14 @@ const setupData = new SlashCommandBuilder()
   .addChannelOption((opt) =>
     opt
       .setName("channel")
-      .setDescription("Channel where alerts will be posted")
+      .setDescription("Channel where new reports await review")
+      .addChannelTypes(ChannelType.GuildText)
+      .setRequired(true)
+  )
+  .addChannelOption((opt) =>
+    opt
+      .setName("announcement-channel")
+      .setDescription("Channel where confirmed hijack alerts (from any server) get published")
       .addChannelTypes(ChannelType.GuildText)
       .setRequired(true)
   )
@@ -43,6 +55,12 @@ const setupData = new SlashCommandBuilder()
       .setName("moderator-role")
       .setDescription("Role allowed to approve or reject reports")
       .setRequired(true)
+  )
+  .addBooleanOption((opt) =>
+    opt
+      .setName("self-announce")
+      .setDescription("Also publish this server's own confirmed alerts in its announcement channel (default: yes)")
+      .setRequired(false)
   );
 
 async function setupExecute(interaction: ChatInputCommandInteraction) {
@@ -52,17 +70,28 @@ async function setupExecute(interaction: ChatInputCommandInteraction) {
   }
 
   const channel = interaction.options.getChannel("channel", true);
+  const announcementChannel = interaction.options.getChannel("announcement-channel", true);
   const notifyRole = interaction.options.getRole("notify-role", true);
   const moderatorRole = interaction.options.getRole("moderator-role", true);
+  const selfAnnounce = interaction.options.getBoolean("self-announce") ?? true;
 
-  setGuildConfig(interaction.guildId, channel.id, notifyRole.id, moderatorRole.id);
+  setGuildConfig(
+    interaction.guildId,
+    channel.id,
+    announcementChannel.id,
+    notifyRole.id,
+    moderatorRole.id,
+    selfAnnounce
+  );
 
   await interaction.reply({
     content:
       `Configuration saved:\n` +
-      `Channel: <#${channel.id}>\n` +
+      `Review channel: <#${channel.id}>\n` +
+      `Announcement channel: <#${announcementChannel.id}>\n` +
       `Notify role: <@&${notifyRole.id}>\n` +
-      `Moderator role: <@&${moderatorRole.id}>`,
+      `Moderator role: <@&${moderatorRole.id}>\n` +
+      `Self-announce: ${selfAnnounce ? "enabled" : "disabled"}`,
     ephemeral: true,
   });
 }
@@ -91,9 +120,11 @@ async function configExecute(interaction: ChatInputCommandInteraction) {
   await interaction.reply({
     content:
       `**Current configuration**\n` +
-      `Channel: <#${config.log_channel_id}>\n` +
+      `Review channel: <#${config.log_channel_id}>\n` +
+      `Announcement channel: <#${config.announcement_channel_id}>\n` +
       `Notify role: <@&${config.notify_role_id}>\n` +
-      `Moderator role: <@&${config.moderator_role_id}>`,
+      `Moderator role: <@&${config.moderator_role_id}>\n` +
+      `Self-announce: ${config.self_announce_enabled ? "enabled" : "disabled"}`,
     ephemeral: true,
   });
 }
@@ -154,10 +185,18 @@ const alertData = new SlashCommandBuilder()
   )
   .addStringOption((opt) =>
     opt.setName("message").setDescription("Optional message or context").setRequired(false)
-  )
-  .addAttachmentOption((opt) =>
-    opt.setName("image").setDescription("Optional screenshot or proof").setRequired(false)
   );
+
+// image1..image5: optional screenshots/proof, added dynamically to stay in
+// sync with MAX_IMAGES.
+for (let i = 1; i <= MAX_IMAGES; i++) {
+  alertData.addAttachmentOption((opt) =>
+    opt
+      .setName(`image${i}`)
+      .setDescription(`Optional screenshot or proof (${i}/${MAX_IMAGES})`)
+      .setRequired(false)
+  );
+}
 
 async function alertExecute(interaction: ChatInputCommandInteraction) {
   if (!interaction.guildId) {
@@ -177,34 +216,33 @@ async function alertExecute(interaction: ChatInputCommandInteraction) {
   const target = interaction.options.getUser("member", true);
   const hijackStatus = interaction.options.getString("status", true) as HijackStatus;
   const message = interaction.options.getString("message");
-  const attachment = interaction.options.getAttachment("image");
 
-  if (attachment && !attachment.contentType?.startsWith("image/")) {
-    await interaction.reply({ content: "The attached file must be an image.", ephemeral: true });
-    return;
-  }
+  const attachments = Array.from({ length: MAX_IMAGES }, (_, i) =>
+    interaction.options.getAttachment(`image${i + 1}`)
+  ).filter((a): a is NonNullable<typeof a> => a !== null);
 
-  let imageChannelId: string | null = null;
-  let imageMessageId: string | null = null;
-
-  if (attachment) {
-    const stored = await uploadImageToStorage(interaction.client, attachment);
-    if (stored) {
-      imageChannelId = stored.channelId;
-      imageMessageId = stored.messageId;
+  for (const attachment of attachments) {
+    if (!attachment.contentType?.startsWith("image/")) {
+      await interaction.reply({ content: "All attached files must be images.", ephemeral: true });
+      return;
     }
   }
+
+  const uploadedImages = attachments.length
+    ? await uploadImagesToStorage(interaction.client, attachments)
+    : [];
 
   const reportId = insertHijackReport({
     guildId: interaction.guildId,
     targetUserId: target.id,
     reportedByUserId: interaction.user.id,
     message,
-    imageChannelId,
-    imageMessageId,
     hijackStatus,
+    images: uploadedImages,
   });
 
+  // New reports still land in the review channel (log_channel_id), pending
+  // approval. Only the announcement channel differs once a report is approved.
   const channel = await interaction.guild?.channels.fetch(config.log_channel_id);
   if (channel?.isTextBased()) {
     const statusLabel = hijackStatus === "active" ? "🔴 Ongoing" : "🟢 Resolved";
@@ -227,7 +265,7 @@ async function alertExecute(interaction: ChatInputCommandInteraction) {
         `**Reported by:** <@${interaction.user.id}>` +
         (message ? `\n**Message:** ${message}` : ""),
       components: [row],
-      ...(attachment ? { files: [attachment.url] } : {}),
+      ...(attachments.length ? { files: attachments.map((a) => a.url) } : {}),
     });
   }
 
@@ -255,13 +293,15 @@ async function statusExecute(interaction: ChatInputCommandInteraction) {
         timeStyle: "short",
         timeZone: "UTC",
       });
-      const imageUrl = await resolveImageUrl(interaction.client, report);
+
+      const imageRefs = getHijackReportImages(report.id);
+      const imageUrls = await resolveImageUrls(interaction.client, imageRefs);
 
       return (
         `**${date} UTC** — ${statusLabel}\n` +
         `Reported in: ${guildName}` +
         (report.message ? `\nMessage: ${report.message}` : "") +
-        (imageUrl ? `\nImage: ${imageUrl}` : "")
+        (imageUrls.length ? `\nImages:\n${imageUrls.join("\n")}` : "")
       );
     })
   );

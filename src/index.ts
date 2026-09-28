@@ -7,8 +7,14 @@ import {
   Routes,
   ButtonInteraction,
 } from "discord.js";
-import { getGuildConfig, getHijackReport, reviewHijackReport, getAllGuildConfigs } from "./db.js";
-import { resolveImageUrl } from "./images.js";
+import {
+  getGuildConfig,
+  getHijackReport,
+  reviewHijackReport,
+  getAllGuildConfigs,
+  getHijackReportImages,
+} from "./db.js";
+import { resolveImageUrls } from "./images.js";
 import { commands } from "./commands.js";
 
 // ---- Client & connexion ----
@@ -91,7 +97,9 @@ export async function handleReportReview(interaction: ButtonInteraction) {
   if (approvalStatus === "approved") {
     const statusLabel = report.hijack_status === "active" ? "🔴 Ongoing" : "🟢 Resolved";
     const originGuildName = interaction.guild.name;
-    const imageUrl = await resolveImageUrl(interaction.client, report);
+
+    const imageRefs = getHijackReportImages(reportId);
+    const imageUrls = await resolveImageUrls(interaction.client, imageRefs);
 
     const allConfigs = getAllGuildConfigs();
 
@@ -112,7 +120,7 @@ export async function handleReportReview(interaction: ButtonInteraction) {
             `**Status:** ${statusLabel}\n` +
             `**Originally reported in:** ${originGuildName}` +
             (report.message ? `\n**Message:** ${report.message}` : ""),
-          ...(imageUrl ? { files: [imageUrl] } : {}),
+          ...(imageUrls.length ? { files: imageUrls } : {}),
         });
       } catch {
         continue;

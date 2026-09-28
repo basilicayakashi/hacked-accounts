@@ -1,4 +1,3 @@
-// src/db.ts
 import Database from "better-sqlite3";
 
 export const db: Database.Database = new Database("bot.sqlite");
@@ -30,34 +29,97 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_hijack_reports_guild_id
   ON hijack_reports(guild_id);
+
+  -- Multiple images per report. image_channel_id/image_message_id above are kept
+  -- only for backward compatibility with rows created before this table existed;
+  -- new reports no longer write to them.
+  CREATE TABLE IF NOT EXISTS hijack_report_images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES hijack_reports(id) ON DELETE CASCADE,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_hijack_report_images_report_id
+  ON hijack_report_images(report_id);
+
+  -- One-time-per-row migration: pull any legacy single image into the new table.
+  -- Idempotent - a report already present in hijack_report_images is skipped.
+  INSERT INTO hijack_report_images (report_id, channel_id, message_id, position)
+  SELECT id, image_channel_id, image_message_id, 0
+  FROM hijack_reports
+  WHERE image_channel_id IS NOT NULL
+    AND image_message_id IS NOT NULL
+    AND id NOT IN (SELECT report_id FROM hijack_report_images);
 `);
 
+// SQLite has no "ADD COLUMN IF NOT EXISTS", so each new guild_config column
+// is added through a small check-then-migrate step, run on every startup but
+// only ever applied once per column.
+const guildConfigColumns = db.prepare(`PRAGMA table_info(guild_config)`).all() as { name: string }[];
+const hasColumn = (name: string) => guildConfigColumns.some((c) => c.name === name);
+
+if (!hasColumn("announcement_channel_id")) {
+  // Dedicated channel for cross-server announcements, separate from the
+  // review channel (log_channel_id). Existing servers default to their
+  // current review channel until they re-run /setup.
+  db.exec(`ALTER TABLE guild_config ADD COLUMN announcement_channel_id TEXT`);
+  db.exec(`UPDATE guild_config SET announcement_channel_id = log_channel_id WHERE announcement_channel_id IS NULL`);
+}
+
+if (!hasColumn("self_announce_enabled")) {
+  // Whether a confirmed alert originally reported on this server also gets
+  // republished in this server's own announcement channel. Defaults to
+  // enabled (1) so existing behavior is unchanged unless a server opts out.
+  db.exec(`ALTER TABLE guild_config ADD COLUMN self_announce_enabled INTEGER NOT NULL DEFAULT 1`);
+}
+
 // ---- Guild config ----
+
+export interface GuildConfig {
+  guild_id: string;
+  log_channel_id: string;
+  announcement_channel_id: string;
+  notify_role_id: string;
+  moderator_role_id: string;
+  self_announce_enabled: 0 | 1;
+}
 
 export function setGuildConfig(
   guildId: string,
   logChannelId: string,
+  announcementChannelId: string,
   notifyRoleId: string,
-  moderatorRoleId: string
+  moderatorRoleId: string,
+  selfAnnounceEnabled: boolean
 ) {
   db.prepare(`
-    INSERT INTO guild_config (guild_id, log_channel_id, notify_role_id, moderator_role_id)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO guild_config
+      (guild_id, log_channel_id, announcement_channel_id, notify_role_id, moderator_role_id, self_announce_enabled)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(guild_id) DO UPDATE SET
       log_channel_id=excluded.log_channel_id,
+      announcement_channel_id=excluded.announcement_channel_id,
       notify_role_id=excluded.notify_role_id,
-      moderator_role_id=excluded.moderator_role_id
-  `).run(guildId, logChannelId, notifyRoleId, moderatorRoleId);
+      moderator_role_id=excluded.moderator_role_id,
+      self_announce_enabled=excluded.self_announce_enabled
+  `).run(
+    guildId,
+    logChannelId,
+    announcementChannelId,
+    notifyRoleId,
+    moderatorRoleId,
+    selfAnnounceEnabled ? 1 : 0
+  );
 }
 
 export function getGuildConfig(guildId: string) {
   return db.prepare(`
-    SELECT guild_id, log_channel_id, notify_role_id, moderator_role_id
+    SELECT guild_id, log_channel_id, announcement_channel_id, notify_role_id, moderator_role_id, self_announce_enabled
     FROM guild_config
     WHERE guild_id = ?
-  `).get(guildId) as
-    | { guild_id: string; log_channel_id: string; notify_role_id: string; moderator_role_id: string }
-    | undefined;
+  `).get(guildId) as GuildConfig | undefined;
 }
 
 // ---- Hijack reports ----
@@ -71,6 +133,8 @@ export interface HijackReport {
   target_user_id: string;
   reported_by_user_id: string;
   message: string | null;
+  // Legacy single-image columns, no longer populated for new reports.
+  // See hijack_report_images for the current, multi-image model.
   image_channel_id: string | null;
   image_message_id: string | null;
   hijack_status: HijackStatus;
@@ -80,39 +144,66 @@ export interface HijackReport {
   reviewed_at: string | null;
 }
 
+export interface HijackReportImage {
+  channel_id: string;
+  message_id: string;
+  position: number;
+}
+
 export function insertHijackReport(params: {
   guildId: string;
   targetUserId: string;
   reportedByUserId: string;
   message: string | null;
-  imageChannelId: string | null;
-  imageMessageId: string | null;
   hijackStatus: HijackStatus;
+  images: { channelId: string; messageId: string }[];
 }): number {
   const createdAt = new Date().toISOString();
 
-  const result = db.prepare(`
-    INSERT INTO hijack_reports
-      (guild_id, target_user_id, reported_by_user_id, message, image_channel_id, image_message_id, hijack_status, approval_status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-  `).run(
-    params.guildId,
-    params.targetUserId,
-    params.reportedByUserId,
-    params.message,
-    params.imageChannelId,
-    params.imageMessageId,
-    params.hijackStatus,
-    createdAt
-  );
+  const insert = db.transaction((p: typeof params) => {
+    const result = db.prepare(`
+      INSERT INTO hijack_reports
+        (guild_id, target_user_id, reported_by_user_id, message, hijack_status, approval_status, created_at)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?)
+    `).run(
+      p.guildId,
+      p.targetUserId,
+      p.reportedByUserId,
+      p.message,
+      p.hijackStatus,
+      createdAt
+    );
 
-  return Number(result.lastInsertRowid);
+    const reportId = Number(result.lastInsertRowid);
+
+    const insertImage = db.prepare(`
+      INSERT INTO hijack_report_images (report_id, channel_id, message_id, position)
+      VALUES (?, ?, ?, ?)
+    `);
+
+    p.images.forEach((image, index) => {
+      insertImage.run(reportId, image.channelId, image.messageId, index);
+    });
+
+    return reportId;
+  });
+
+  return insert(params);
 }
 
 export function getHijackReport(reportId: number) {
   return db.prepare(`SELECT * FROM hijack_reports WHERE id = ?`).get(reportId) as
     | HijackReport
     | undefined;
+}
+
+export function getHijackReportImages(reportId: number): HijackReportImage[] {
+  return db.prepare(`
+    SELECT channel_id, message_id, position
+    FROM hijack_report_images
+    WHERE report_id = ?
+    ORDER BY position ASC
+  `).all(reportId) as HijackReportImage[];
 }
 
 export function reviewHijackReport(
@@ -129,14 +220,9 @@ export function reviewHijackReport(
 
 export function getAllGuildConfigs() {
   return db.prepare(`
-    SELECT guild_id, log_channel_id, notify_role_id, moderator_role_id
+    SELECT guild_id, log_channel_id, announcement_channel_id, notify_role_id, moderator_role_id, self_announce_enabled
     FROM guild_config
-  `).all() as Array<{
-    guild_id: string;
-    log_channel_id: string;
-    notify_role_id: string;
-    moderator_role_id: string;
-  }>;
+  `).all() as GuildConfig[];
 }
 
 export function getApprovedHijackReportsForUser(targetUserId: string) {
