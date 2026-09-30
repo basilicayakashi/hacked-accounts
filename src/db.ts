@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 
-export const db: Database.Database = new Database("bot.sqlite");
+export const db: Database.Database = new Database("ha_bd.sqlite");
 
 db.exec(`
   PRAGMA journal_mode = WAL;
