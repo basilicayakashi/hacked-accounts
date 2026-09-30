@@ -12,7 +12,7 @@ db.exec(`
     moderator_role_id TEXT NOT NULL
   );
 
- CREATE TABLE IF NOT EXISTS ha_hijack_reports (
+CREATE TABLE IF NOT EXISTS ha_hijack_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id TEXT NOT NULL,
     target_user_id TEXT NOT NULL,
