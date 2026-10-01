@@ -184,7 +184,10 @@ const alertData = new SlashCommandBuilder()
       )
   )
   .addStringOption((opt) =>
-    opt.setName("message").setDescription("Optional message or context").setRequired(false)
+    opt.setName("message")
+        .setDescription("Optional message or context")
+        .setRequired(false)
+        .setMaxLength(800)
   );
 
 // image1..image5: optional screenshots/proof, added dynamically to stay in
