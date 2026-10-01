@@ -103,17 +103,23 @@ export async function handleReportReview(interaction: ButtonInteraction) {
 
     const allConfigs = getAllGuildConfigs();
 
+    // Confirmed alerts are published to every configured server's dedicated
+    // announcement channel, except the server the report originated from
+    // gets skipped if it has opted out via self_announce_enabled.
     for (const guildConfig of allConfigs) {
+      const isOriginGuild = guildConfig.guild_id === report.guild_id;
+      if (isOriginGuild && !guildConfig.self_announce_enabled) continue;
+
       const targetGuild = interaction.client.guilds.cache.get(guildConfig.guild_id);
       if (!targetGuild) continue;
 
-      const notifyChannel = await targetGuild.channels
-        .fetch(guildConfig.log_channel_id)
+      const announcementChannel = await targetGuild.channels
+        .fetch(guildConfig.announcement_channel_id)
         .catch(() => null);
-      if (!notifyChannel?.isTextBased()) continue;
+      if (!announcementChannel?.isTextBased()) continue;
 
       try {
-        await notifyChannel.send({
+        await announcementChannel.send({
           content:
             `<@&${guildConfig.notify_role_id}> Hijack alert confirmed\n` +
             `**Member:** <@${report.target_user_id}>\n` +

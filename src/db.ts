@@ -58,22 +58,6 @@ CREATE TABLE IF NOT EXISTS ha_hijack_reports (
 // is added through a small check-then-migrate step, run on every startup but
 // only ever applied once per column.
 const guildConfigColumns = db.prepare(`PRAGMA table_info(ha_guild_config)`).all() as { name: string }[];
-const hasColumn = (name: string) => guildConfigColumns.some((c) => c.name === name);
-
-if (!hasColumn("announcement_channel_id")) {
-  // Dedicated channel for cross-server announcements, separate from the
-  // review channel (log_channel_id). Existing servers default to their
-  // current review channel until they re-run /setup.
-  db.exec(`ALTER TABLE ha_guild_config ADD COLUMN announcement_channel_id TEXT`);
-  db.exec(`UPDATE ha_guild_config SET announcement_channel_id = log_channel_id WHERE announcement_channel_id IS NULL`);
-}
-
-if (!hasColumn("self_announce_enabled")) {
-  // Whether a confirmed alert originally reported on this server also gets
-  // republished in this server's own announcement channel. Defaults to
-  // enabled (1) so existing behavior is unchanged unless a server opts out.
-  db.exec(`ALTER TABLE ha_guild_config ADD COLUMN self_announce_enabled INTEGER NOT NULL DEFAULT 1`);
-}
 
 // ---- Guild config ----
 
